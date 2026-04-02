@@ -4,6 +4,7 @@ set -e
 #===============================================================================
 # install-awx-offline.sh
 # Скрипт установки AWX 24.6.1 (offline) с кастомизацией
+# Версия: 1.1 (с исправлениями для кастомного хранилища)
 #===============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -97,6 +98,10 @@ print_config() {
     echo "  Task CPU:        $AWX_TASK_CPU_REQUEST / $AWX_TASK_CPU_LIMIT"
     echo "  Task Memory:     $AWX_TASK_MEMORY_REQUEST / $AWX_TASK_MEMORY_LIMIT"
     echo ""
+    echo -e "${CYAN}AWX:${NC}"
+    echo "  Instance Name:   $AWX_INSTANCE_NAME"
+    echo "  Namespace:       $AWX_NAMESPACE"
+    echo ""
     echo "========================================================================"
     echo ""
 }
@@ -184,21 +189,26 @@ create_storage_directories() {
 
     log_step "Создание директорий для хранилища..."
 
-    # Создание директорий
-    mkdir -p "$POSTGRES_DATA_DIR"
-    mkdir -p "$PROJECTS_DATA_DIR"
+    # Создание базовой директории
+    mkdir -p "$AWX_DATA_DIR"
+    chmod 755 "$AWX_DATA_DIR"
 
+    # Создание директории PostgreSQL
+    mkdir -p "$POSTGRES_DATA_DIR"
     # ВАЖНО: PostgreSQL требует права 700 и владельца UID 26
     chown -R 26:26 "$POSTGRES_DATA_DIR"
     chmod 700 "$POSTGRES_DATA_DIR"
 
-    # Права для остальных директорий
-    chmod 755 "$AWX_DATA_DIR"
+    # Создание директории Projects
+    mkdir -p "$PROJECTS_DATA_DIR"
     chmod 755 "$PROJECTS_DATA_DIR"
 
     log_info "Директории созданы:"
     log_info "  PostgreSQL: $POSTGRES_DATA_DIR (владелец: 26:26, права: 700)"
     log_info "  Projects:   $PROJECTS_DATA_DIR"
+
+    # Проверка
+    ls -la "$AWX_DATA_DIR"
 }
 
 #-------------------------------------------------------------------------------
@@ -253,7 +263,7 @@ setup_kubeconfig() {
     grep -q "KUBECONFIG" "$REAL_HOME/.bashrc" 2>/dev/null || \
         echo 'export KUBECONFIG=~/.kube/config' >> "$REAL_HOME/.bashrc"
 
-    log_info "kubeconfig настроен"
+    log_info "kubeconfig настроен для пользователя $REAL_USER"
 }
 
 #-------------------------------------------------------------------------------
@@ -264,20 +274,34 @@ wait_for_k3s() {
 
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-    if ! systemctl is-active --quiet k3s; then
-        log_error "Служба K3s не запущена"
-        systemctl status k3s
-        exit 1
-    fi
-
-    local timeout=120
+    # Проверка службы
+    local timeout=60
     local elapsed=0
 
-    until kubectl get nodes 2>/dev/null | grep -q "Ready"; do
-        [ $elapsed -ge $timeout ] && {
-            log_error "Таймаут ожидания K3s"
+    until systemctl is-active --quiet k3s; do
+        if [ $elapsed -ge $timeout ]; then
+            log_error "Служба K3s не запустилась"
+            systemctl status k3s --no-pager || true
             exit 1
-        }
+        fi
+        echo -n "."
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    # Ожидание готовности ноды
+    timeout=120
+    elapsed=0
+
+    until kubectl get nodes 2>/dev/null | grep -q "Ready"; do
+        if [ $elapsed -ge $timeout ]; then
+            log_error "Таймаут ожидания K3s"
+            log_error "Статус службы:"
+            systemctl status k3s --no-pager || true
+            log_error "Логи:"
+            journalctl -u k3s --no-pager -n 20 || true
+            exit 1
+        fi
         echo -n "."
         sleep 5
         elapsed=$((elapsed + 5))
@@ -305,18 +329,29 @@ import_images() {
     )
 
     for img in "${images[@]}"; do
-        [ -f "$IMAGES_DIR/$img" ] && {
+        if [ -f "$IMAGES_DIR/$img" ]; then
             log_info "  Импорт $img..."
-            k3s ctr images import "$IMAGES_DIR/$img" 2>&1 || true
-        }
+            k3s ctr images import "$IMAGES_DIR/$img" 2>&1 || {
+                log_warn "  Повторная попытка для $img..."
+                sleep 2
+                k3s ctr images import "$IMAGES_DIR/$img" 2>&1 || true
+            }
+        else
+            log_warn "  Файл не найден: $img"
+        fi
     done
 
     # Создание тега для kube-rbac-proxy
+    log_info "  Создание тега для kube-rbac-proxy..."
     k3s ctr images tag \
         quay.io/brancz/kube-rbac-proxy:v0.18.0 \
         gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0 2>/dev/null || true
 
     log_info "Образы импортированы"
+    
+    # Проверка
+    log_info "Проверка образов:"
+    k3s ctr images list | grep -E "awx|postgres|redis" | head -10
 }
 
 #-------------------------------------------------------------------------------
@@ -329,7 +364,7 @@ install_kustomize() {
     mv /tmp/kustomize /usr/local/bin/
     chmod +x /usr/local/bin/kustomize
 
-    log_info "Kustomize установлен"
+    log_info "Kustomize установлен: $(kustomize version --short 2>/dev/null || echo 'OK')"
 }
 
 #-------------------------------------------------------------------------------
@@ -337,6 +372,7 @@ install_kustomize() {
 #-------------------------------------------------------------------------------
 create_custom_storage() {
     if [ "$CUSTOM_STORAGE_ENABLED" != "true" ]; then
+        log_info "Кастомное хранилище отключено, пропуск шага 6"
         return
     fi
 
@@ -346,8 +382,10 @@ create_custom_storage() {
 
     # Получение имени ноды
     local node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+    log_info "Имя ноды: $node_name"
 
     # Создание StorageClass
+    log_info "Создание StorageClass..."
     cat <<STORAGE_EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -360,12 +398,16 @@ volumeBindingMode: Immediate
 reclaimPolicy: Retain
 STORAGE_EOF
 
-    # PV для PostgreSQL с claimRef
+    # PV для PostgreSQL с claimRef для привязки к конкретному PVC
+    log_info "Создание PV для PostgreSQL..."
     cat <<PV_POSTGRES_EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: awx-postgres-pv
+  labels:
+    type: local
+    app: awx-postgres
 spec:
   storageClassName: awx-local-storage
   capacity:
@@ -390,11 +432,15 @@ spec:
 PV_POSTGRES_EOF
 
     # PV для Projects с claimRef
+    log_info "Создание PV для Projects..."
     cat <<PV_PROJECTS_EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: awx-projects-pv
+  labels:
+    type: local
+    app: awx-projects
 spec:
   storageClassName: awx-local-storage
   capacity:
@@ -419,7 +465,9 @@ spec:
 PV_PROJECTS_EOF
 
     log_info "Кастомное хранилище настроено"
+    echo ""
     kubectl get pv
+    echo ""
 }
 
 #-------------------------------------------------------------------------------
@@ -431,7 +479,7 @@ generate_awx_manifest() {
     local storage_class="local-path"
     [ "$CUSTOM_STORAGE_ENABLED" = "true" ] && storage_class="awx-local-storage"
 
-    cat <<AWX_MANIFEST_EOF > "$SCRIPT_DIR/awx-instance.yaml"
+    cat > "$SCRIPT_DIR/awx-instance.yaml" <<AWX_MANIFEST_EOF
 apiVersion: awx.ansible.com/v1beta1
 kind: AWX
 metadata:
@@ -481,7 +529,7 @@ spec:
       memory: "${AWX_EE_MEMORY_LIMIT}"
 AWX_MANIFEST_EOF
 
-    log_info "Манифест AWX создан"
+    log_info "Манифест AWX создан: $SCRIPT_DIR/awx-instance.yaml"
 }
 
 #-------------------------------------------------------------------------------
@@ -492,31 +540,28 @@ install_awx() {
 
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-    # Создание namespace
-    kubectl create namespace "$AWX_NAMESPACE" 2>/dev/null || true
-
-    # Генерация манифеста
+    # Генерация манифеста AWX Instance
     generate_awx_manifest
 
     # Установка оператора
     log_info "Применение манифеста AWX Operator..."
     kubectl apply -f "$SCRIPT_DIR/awx-operator-full.yaml"
 
-    # Ожидание оператора
-    log_info "Ожидание AWX Operator..."
+    # Ожидание готовности оператора
+    log_info "Ожидание готовности AWX Operator..."
     local timeout=300
     local elapsed=0
 
     until kubectl -n "$AWX_NAMESPACE" get pods 2>/dev/null | grep "awx-operator" | grep -q "2/2.*Running"; do
-        [ $elapsed -ge $timeout ] && {
+        if [ $elapsed -ge $timeout ]; then
             log_error "Таймаут ожидания AWX Operator"
             kubectl -n "$AWX_NAMESPACE" get pods
             exit 1
-        }
-        [ $((elapsed % 30)) -eq 0 ] && [ $elapsed -gt 0 ] && {
+        fi
+        if [ $((elapsed % 30)) -eq 0 ] && [ $elapsed -gt 0 ]; then
             echo ""
             kubectl -n "$AWX_NAMESPACE" get pods 2>/dev/null || true
-        }
+        fi
         echo -n "."
         sleep 10
         elapsed=$((elapsed + 10))
@@ -525,13 +570,15 @@ install_awx() {
     echo ""
     log_info "AWX Operator готов"
 
-    # Установка AWX
-    log_info "Применение манифеста AWX..."
+    # Установка AWX Instance
+    log_info "Применение манифеста AWX Instance..."
     kubectl apply -f "$SCRIPT_DIR/awx-instance.yaml"
+
+    log_info "AWX Instance создан, ожидание запуска компонентов..."
 }
 
 #-------------------------------------------------------------------------------
-# Ожидание AWX
+# Ожидание готовности AWX
 #-------------------------------------------------------------------------------
 wait_for_awx() {
     log_info "Ожидание готовности AWX (5-15 минут)..."
@@ -542,14 +589,15 @@ wait_for_awx() {
     local elapsed=0
 
     until kubectl -n "$AWX_NAMESPACE" get pods 2>/dev/null | grep "awx-web" | grep -q "3/3.*Running"; do
-        [ $elapsed -ge $timeout ] && {
-            log_warn "Таймаут, но AWX может ещё запускаться"
+        if [ $elapsed -ge $timeout ]; then
+            log_warn "Таймаут ожидания, но AWX может ещё запускаться"
+            log_warn "Проверьте статус вручную: kubectl -n $AWX_NAMESPACE get pods"
             break
-        }
-        [ $((elapsed % 30)) -eq 0 ] && {
+        fi
+        if [ $((elapsed % 30)) -eq 0 ]; then
             echo ""
             kubectl -n "$AWX_NAMESPACE" get pods 2>/dev/null | grep -E "awx-|postgres" || true
-        }
+        fi
         echo -n "."
         sleep 10
         elapsed=$((elapsed + 10))
@@ -562,6 +610,8 @@ wait_for_awx() {
 # Копирование скриптов проверки
 #-------------------------------------------------------------------------------
 copy_helper_scripts() {
+    log_info "Копирование скриптов проверки..."
+
     if [ -n "$SUDO_USER" ]; then
         REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
         REAL_USER="$SUDO_USER"
@@ -571,23 +621,38 @@ copy_helper_scripts() {
     fi
 
     # Копируем скрипты проверки если они есть
+    local copied=0
     for script in check-awx.sh check-k3s-network.sh check-storage.sh; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$REAL_HOME/"
             chmod +x "$REAL_HOME/$script"
             chown "$REAL_USER:$REAL_USER" "$REAL_HOME/$script"
+            copied=$((copied + 1))
         fi
     done
 
-    log_info "Скрипты проверки скопированы в $REAL_HOME/"
+    if [ $copied -gt 0 ]; then
+        log_info "Скопировано $copied скриптов в $REAL_HOME/"
+    else
+        log_warn "Скрипты проверки не найдены в $SCRIPT_DIR/"
+    fi
 }
 
 #-------------------------------------------------------------------------------
 # Вывод информации
 #-------------------------------------------------------------------------------
 print_info() {
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
     local IP=$(hostname -I | awk '{print $1}')
-    local PASSWORD=$(kubectl -n "$AWX_NAMESPACE" get secret awx-admin-password -o jsonpath='{.data.password}' 2>/dev/null | base64 --decode 2>/dev/null)
+    local PASSWORD=""
+    
+    # Попытка получить пароль (может не существовать сразу)
+    for i in {1..5}; do
+        PASSWORD=$(kubectl -n "$AWX_NAMESPACE" get secret ${AWX_INSTANCE_NAME}-admin-password -o jsonpath='{.data.password}' 2>/dev/null | base64 --decode 2>/dev/null)
+        [ -n "$PASSWORD" ] && break
+        sleep 5
+    done
 
     echo ""
     echo "========================================================================"
@@ -606,14 +671,20 @@ print_info() {
         echo "  Используется: /var/lib/rancher/k3s/storage/"
     fi
     echo ""
-    echo "Статус подов:"
+    echo -e "${CYAN}Статус подов:${NC}"
     kubectl -n "$AWX_NAMESPACE" get pods 2>/dev/null || true
     echo ""
     echo "------------------------------------------------------------------------"
     echo ""
     echo -e "URL:      ${BLUE}http://${IP}:${AWX_NODE_PORT}${NC}"
     echo -e "Логин:    ${YELLOW}admin${NC}"
-    [ -n "$PASSWORD" ] && echo -e "Пароль:   ${YELLOW}${PASSWORD}${NC}"
+    if [ -n "$PASSWORD" ]; then
+        echo -e "Пароль:   ${YELLOW}${PASSWORD}${NC}"
+    else
+        echo -e "Пароль:   ${YELLOW}(получить командой ниже)${NC}"
+        echo ""
+        echo "  kubectl -n $AWX_NAMESPACE get secret ${AWX_INSTANCE_NAME}-admin-password -o jsonpath='{.data.password}' | base64 --decode; echo"
+    fi
     echo ""
     echo "------------------------------------------------------------------------"
     echo ""
@@ -622,11 +693,16 @@ print_info() {
     echo "  ~/check-k3s-network.sh  # Сетевая конфигурация"
     echo "  ~/check-storage.sh      # Хранилище"
     echo ""
+    echo "Полезные команды:"
+    echo "  kubectl -n $AWX_NAMESPACE get pods              # Статус подов"
+    echo "  kubectl -n $AWX_NAMESPACE logs <pod-name>       # Логи пода"
+    echo "  kubectl -n $AWX_NAMESPACE get pvc               # Состояние хранилища"
+    echo ""
     echo "========================================================================"
 }
 
 #-------------------------------------------------------------------------------
-# Main
+# Главная функция
 #-------------------------------------------------------------------------------
 main() {
     echo ""
@@ -635,16 +711,21 @@ main() {
     echo "========================================================================"
     echo ""
 
+    # Проверки
     check_root
     load_config
     print_config
 
+    # Подтверждение
     read -p "Продолжить установку с этими параметрами? (y/n): " response
-    [ "$response" != "y" ] && {
+    if [ "$response" != "y" ]; then
         echo "Отредактируйте $CONFIG_FILE и запустите снова"
         exit 0
-    }
+    fi
 
+    echo ""
+
+    # Установка
     check_network_conflicts
     check_files
     create_storage_directories
@@ -660,4 +741,5 @@ main() {
     print_info
 }
 
+# Запуск
 main "$@"
