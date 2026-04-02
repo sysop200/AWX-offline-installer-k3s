@@ -356,19 +356,16 @@ metadata:
   annotations:
     storageclass.kubernetes.io/is-default-class: "false"
 provisioner: kubernetes.io/no-provisioner
-volumeBindingMode: WaitForFirstConsumer
+volumeBindingMode: Immediate
 reclaimPolicy: Retain
 STORAGE_EOF
 
-    # PV для PostgreSQL
+    # PV для PostgreSQL с claimRef
     cat <<PV_POSTGRES_EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: awx-postgres-pv
-  labels:
-    type: local
-    app: awx-postgres
 spec:
   storageClassName: awx-local-storage
   capacity:
@@ -376,6 +373,9 @@ spec:
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: ${AWX_NAMESPACE}
+    name: postgres-15-${AWX_INSTANCE_NAME}-postgres-15-0
   hostPath:
     path: "${POSTGRES_DATA_DIR}"
     type: DirectoryOrCreate
@@ -389,15 +389,12 @@ spec:
                 - ${node_name}
 PV_POSTGRES_EOF
 
-    # PV для Projects
+    # PV для Projects с claimRef
     cat <<PV_PROJECTS_EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: awx-projects-pv
-  labels:
-    type: local
-    app: awx-projects
 spec:
   storageClassName: awx-local-storage
   capacity:
@@ -405,6 +402,9 @@ spec:
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: ${AWX_NAMESPACE}
+    name: ${AWX_INSTANCE_NAME}-projects-claim
   hostPath:
     path: "${PROJECTS_DATA_DIR}"
     type: DirectoryOrCreate
