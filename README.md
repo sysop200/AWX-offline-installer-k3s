@@ -1022,6 +1022,7 @@ create_readme() {
     log_info "Создание README..."
 
     cat <<'README_EOF' > "$DIST_DIR/README.md"
+
 # AWX 24.6.1 Offline Installation
 
 ## Быстрый старт
